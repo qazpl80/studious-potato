@@ -31,6 +31,7 @@ import logging
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,6 +40,8 @@ log = logging.getLogger("vmware")
 # VIX guest-ops error codes worth distinguishing from generic failure.
 VIX_E_GUEST_AUTH = "Invalid user name or password"
 VM_ENCRYPTED = "Incorrect password"
+# vmrun prints this when the guest program started and exited non-zero.
+GUEST_PROGRAM_RAN = "Guest program exited with"
 VIX_E_TOOLS = "VMware Tools are not running"
 
 # .vmx disk attachment keys, e.g. 'nvme0:1.fileName = "data.vmdk"'.
@@ -52,6 +55,32 @@ _VMX_DISK_RE = re.compile(
 
 class VMwareError(RuntimeError):
     pass
+
+
+def probe_hint(message: str) -> str:
+    """Map a runProgramInGuest failure to a likely cause."""
+    m = message.lower()
+    hints = [
+        ("logged in interactively",
+         "nobody is logged on to the guest desktop yet. Normal for up to a "
+         "minute after Tools starts while auto-logon runs; if it persists, "
+         "the 'clean' snapshot boots to the lock screen or a failed "
+         "auto-logon - see README Part 5"),
+        ("could not be contacted",
+         "Tools service is up but its guest-ops agent is not; usually "
+         "clears within a minute of boot"),
+        ("insufficient permissions",
+         "the account lacks rights in the guest - it must be a local "
+         "administrator, and UAC should be off (prepare_baseline step 6)"),
+        ("not found",
+         "the program path does not exist in the guest"),
+        ("timed out",
+         "the guest is too busy to answer yet; normal for the first minute"),
+    ]
+    for needle, hint in hints:
+        if needle in m:
+            return f"\n    likely cause: {hint}"
+    return ""
 
 
 class VMware:
@@ -172,10 +201,62 @@ class VMware:
         # revertToSnapshot can leave a stale lock directory momentarily.
         self._wait_unlocked()
 
-    def start(self, headless: bool = True):
-        log.info("starting VM (%s)", "nogui" if headless else "gui")
-        self._run(["start", self.vmx, "nogui" if headless else "gui"],
-                  timeout=900)
+    def start(self, headless: bool = True, timeout: int = 600):
+        """Power on. Normally returns in a few seconds.
+
+        `vmrun start` does not return until the VM is actually powered on,
+        so if Workstation is showing a dialog - a VM question ("moved or
+        copied?"), a licence or update prompt on Workstation's first launch
+        after a host reboot, a password prompt - it blocks silently. The
+        call is therefore run in the background and watched: VM questions
+        are read from vmware.log and reported, and anything else gets a
+        periodic hint pointing at the Workstation window.
+        """
+        mode = "nogui" if headless else "gui"
+        log.info("starting VM (%s)", mode)
+        cmd = self._base() + ["start", self.vmx, mode]
+        log.debug("%s", " ".join("***" if a in {self.password, self.vm_password}
+                                 and a else a for a in cmd))
+        # Output goes to temp FILES, not pipes. With `gui`, if Workstation
+        # is not already open, vmrun launches vmware.exe, which inherits
+        # vmrun's stdout/stderr handles and keeps running after vmrun exits.
+        # Reading a pipe waits for EOF, and EOF never comes while Workstation
+        # is open - so capturing output with pipes hung here forever whenever
+        # Workstation had not been started first (e.g. after a host reboot).
+        out_f = tempfile.TemporaryFile(mode="w+")
+        err_f = tempfile.TemporaryFile(mode="w+")
+        proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f,
+                                stdin=subprocess.DEVNULL)
+        started = time.time()
+        next_hint = started + 30
+        reported = None
+        while proc.poll() is None:
+            if time.time() - started > timeout:
+                proc.kill()
+                raise VMwareError(
+                    f"vmrun start did not return within {timeout}s - a "
+                    "dialog in the Workstation window is almost certainly "
+                    "waiting for an answer")
+            question = self.pending_question()
+            if question and question != reported:
+                log.warning("the VM is waiting on a VMware dialog: %s - "
+                            "answer it in the Workstation window", question)
+                reported = question
+            if time.time() >= next_hint:
+                log.warning("still powering on after %ds. vmrun waits until "
+                            "the VM is running, so a dialog is probably open "
+                            "in Workstation (check the taskbar - it may be "
+                            "behind other windows). Answer it and the run "
+                            "continues.", int(time.time() - started))
+                next_hint += 60
+            time.sleep(3)
+        out_f.seek(0); err_f.seek(0)
+        out, err = out_f.read(), err_f.read()
+        out_f.close(); err_f.close()
+        if proc.returncode != 0:
+            raise VMwareError(f"vmrun start failed ({proc.returncode}): "
+                              f"{(out + ' ' + err).strip()[:400]}")
+        log.info("VM powered on (%ds)", int(time.time() - started))
 
     def stop(self, hard: bool = False):
         """soft = ACPI shutdown request via Tools; hard = power cut.
@@ -208,15 +289,24 @@ class VMware:
         Workstation holds exclusive locks on the VMDK chain via sibling
         '<disk>.vmdk.lck' directories. Any attempt to read or convert the
         disk while these exist fails or, worse, reads a torn image.
+
+        Only DISK locks are waited on. The '.vmx.lck' lock also persists for
+        as long as the VM is open in a Workstation tab - powered off or not -
+        so waiting on it made every --gui run stall here for the full
+        timeout without protecting anything.
         """
         vm_dir = Path(self.vmx).parent
         deadline = time.time() + timeout
+        locks: list[Path] = []
         while time.time() < deadline:
-            if not list(vm_dir.glob("*.lck")):
+            locks = list(vm_dir.glob("*.vmdk.lck"))
+            if not locks:
                 return
             time.sleep(2)
-        log.warning("lock directories still present in %s after %ds",
-                    vm_dir, timeout)
+        log.warning("disk locks still present after %ds: %s. If the VM is "
+                    "open in a Workstation tab, close the tab (the VM stays "
+                    "powered off) so the disk can be read.", timeout,
+                    ", ".join(l.name for l in locks))
 
     # -- guest operations --------------------------------------------------
 
@@ -283,6 +373,7 @@ class VMware:
         deadline = started + timeout
         last = ""
         prev_state = None
+        prev_probe = None
         next_hint = started + 60
 
         while time.time() < deadline:
@@ -306,27 +397,53 @@ class VMware:
                          state, elapsed)
                 prev_state = state
             if state != "running" and time.time() >= next_hint:
-                log.info("still waiting for Tools after %ds. To see why, open "
-                         "the VM in Workstation (it is running headless) and "
-                         "look at its screen.", elapsed)
+                log.info("still waiting for Tools after %ds. A healthy boot "
+                         "takes ~20-60s. If opening the VM's window makes it "
+                         "ready at once, Windows is throttling the background "
+                         "VM: run the powercfg command in README Part 5 "
+                         "('VM only progresses while its window is open').",
+                         elapsed)
                 next_hint += 60
             if state == "running":
+                # Probe with a program that takes no arguments. The earlier
+                # `cmd.exe /c "exit 0"` exits 1 in the guest - vmrun appears to
+                # re-quote the space-containing argument on its way in -
+                # so the probe failed forever even though guest operations
+                # were working perfectly.
+                #
+                # -interactive matches how the agent itself is launched, so
+                # "ready" means a user is logged on to the desktop - not just
+                # that Tools answers. Tools comes up ~20 s before auto-logon
+                # completes; without -interactive here the probe passed at
+                # that moment and the agent then failed with "must be logged
+                # in interactively".
                 proc = self._run(
                     ["-gu", self.user, "-gp", self.password,
-                     "runProgramInGuest", self.vmx,
-                     "C:\\Windows\\System32\\cmd.exe", "/c", "exit 0"],
+                     "runProgramInGuest", self.vmx, "-interactive",
+                     "C:\\Windows\\System32\\hostname.exe"],
                     timeout=90, check=False,
                 )
-                if proc.returncode == 0:
-                    log.info("guest ready")
+                out = f"{proc.stdout} {proc.stderr}"
+                # Either outcome proves the channel works: the guest
+                # authenticated us, created a process and reported its
+                # exit code back. Only a VIX-level error means "not ready".
+                if proc.returncode == 0 or GUEST_PROGRAM_RAN in out:
+                    log.info("guest ready (%ds after power-on)", elapsed)
                     return
-                last = f"{proc.stdout} {proc.stderr}".strip()
+                text = " ".join(f"{proc.stdout} {proc.stderr}".split())
+                last = f"rc={proc.returncode} {text or '(no output)'}"
                 if VIX_E_GUEST_AUTH in last:
                     # Credentials will not fix themselves; fail fast.
                     raise VMwareError(
                         "guest authentication rejected — verify "
                         "vm.guest_user / vm.guest_pass in config.yaml"
                     )
+                # Print each distinct failure once. Without this the loop is
+                # silent and a permanent error looks like a slow boot.
+                if last != prev_probe:
+                    log.info("test program in guest failed (%ds): %s%s",
+                             elapsed, last, probe_hint(last))
+                    prev_probe = last
             else:
                 last = f"tools state: {state}"
             time.sleep(5)
@@ -432,6 +549,24 @@ def resolve_active_disk(vmx: Path, device: str) -> Path:
     return resolved
 
 
+def _tool_error(proc: subprocess.CompletedProcess) -> str:
+    """The useful part of a converter's output.
+
+    vdiskmanager prints a "Convert: N% done." line per percent, so the first
+    500 characters of its output are pure progress meter and the actual
+    error - always at the end - was being cut off. Drop the progress lines
+    and keep the tail.
+    """
+    text = f"{proc.stdout}\n{proc.stderr}"
+    # \r-separated progress updates are split too, not just \n lines.
+    lines = [l.strip() for l in re.split(r"[\r\n]+", text)]
+    keep = [l for l in lines
+            if l and not re.fullmatch(r"(Convert|Creating disk)\b.*?(\d+% done\.?)?", l)
+            or (l and "fail" in l.lower())]
+    tail = "\n    ".join(keep[-8:]) if keep else "(no error text)"
+    return "\n    " + tail
+
+
 class DiskFlattener:
     """Converts a VMDK snapshot chain into a raw image The Sleuth Kit can read.
 
@@ -440,7 +575,7 @@ class DiskFlattener:
 
       qemu-img            convert -f vmdk -O raw   (preferred: single output
                           file, well-defined behaviour, no VM registration)
-      vmware-vdiskmanager -r -t 0                  (ships with Workstation,
+      vmware-vdiskmanager -r -t 2                  (ships with Workstation,
                           so needs no extra install; emits a descriptor plus
                           a '-flat.vmdk' payload which IS raw sectors)
     """
@@ -478,27 +613,60 @@ class DiskFlattener:
                                   timeout=7200)
             if proc.returncode != 0:
                 raise VMwareError(
-                    "qemu-img convert failed: "
-                    f"{(proc.stderr or proc.stdout).strip()[:500]}"
-                )
+                    f"qemu-img convert failed (exit {proc.returncode}): "
+                    f"{_tool_error(proc)}")
             return out_raw
 
         if self.vdiskmanager:
-            # -t 0 = monolithic flat. Output is '<stem>.vmdk' (text descriptor)
-            # + '<stem>-flat.vmdk' (raw sectors). TSK reads the latter.
+            # -t 2 = preallocated single file ("monolithicFlat"): output is
+            # '<stem>.vmdk' (text descriptor) + '<stem>-flat.vmdk' (raw
+            # sectors), and TSK reads the latter.
+            #
+            # NOT -t 0. Type 0 is "single growable" - a SPARSE vmdk with no
+            # -flat file. That was a bug here: the conversion reported
+            # success, no -flat.vmdk appeared, and the run failed. vdiskmanager
+            # types: 0 growable, 1 growable split, 2 preallocated,
+            # 3 preallocated split, 4 ESX, 5 streamOptimized, 6 thin ESX.
             log.info("flattening %s with vmware-vdiskmanager", source_vmdk.name)
             target_desc = out_raw.with_suffix(".vmdk")
-            cmd = [self.vdiskmanager, "-r", str(source_vmdk), "-t", "0",
+            cmd = [self.vdiskmanager, "-r", str(source_vmdk), "-t", "2",
                    str(target_desc)]
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=7200)
             flat = Path(str(target_desc.with_suffix("")) + "-flat.vmdk")
-            if proc.returncode != 0 or not flat.exists():
-                raise VMwareError(
-                    "vmware-vdiskmanager failed: "
-                    f"{(proc.stdout or proc.stderr).strip()[:500]}"
-                )
-            return flat
+            # Retry: straight after power-off, Workstation can still hold the
+            # disk chain for a while (longer if the VM is open in a
+            # Workstation tab). The same conversion run by hand a few minutes
+            # later succeeds, so a failure here is usually timing, not data.
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                for stale in (target_desc, flat):
+                    if stale.exists():
+                        stale.unlink()
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=7200)
+                if proc.returncode == 0 and flat.exists():
+                    if attempt > 1:
+                        log.info("flatten succeeded on attempt %d", attempt)
+                    return flat
+                if proc.returncode == 0:
+                    # Converted, but not to a flat image - retrying cannot
+                    # change that, so fail with the real reason at once.
+                    made = sorted(p.name for p in target_desc.parent.glob(
+                        target_desc.stem + "*.vmdk"))
+                    raise VMwareError(
+                        "vmware-vdiskmanager reported success but produced no "
+                        f"raw '-flat.vmdk' image (created: {', '.join(made) or 'nothing'})")
+                locks = [l.name for l in source_vmdk.parent.glob("*.lck")]
+                log.warning("vmware-vdiskmanager attempt %d/%d failed (exit "
+                            "%d); locks present: %s%s", attempt, attempts,
+                            proc.returncode, ", ".join(locks) or "none",
+                            _tool_error(proc))
+                if attempt < attempts:
+                    time.sleep(30)
+            raise VMwareError(
+                f"vmware-vdiskmanager failed {attempts} times (exit "
+                f"{proc.returncode}): {_tool_error(proc)}\n"
+                "    Close the VM's tab in Workstation (or Workstation itself) "
+                "during runs - an open tab keeps the VM's files in use.")
 
         raise VMwareError(
             "no disk flattening backend available; install qemu-img or set "

@@ -41,7 +41,12 @@ vm:
   # as -vp when set.
   encryption_password: null
 
+  # Show the VM's window during runs. true is the reliable choice on a
+  # Windows 11 host, which throttles a window-less VM until it is opened.
+  # Override per invocation with --gui / --headless.
+  gui: true
   boot_timeout: 420          # seconds to wait for guest ops to come up
+  post_logon_settle: 45      # quiet period after the desktop appears, before the agent starts
   settle_seconds: 15         # in-guest quiesce before the host cuts power
 
 # ---------------------------------------------------------------------------
@@ -67,7 +72,7 @@ vm:
 disks:
   # Controller address of the EVIDENCE disk as written in the .vmx, e.g.
   # nvme0:1, scsi0:1, sata0:1. Run `python runner.py --show-disks` to list
-  # what is attached and pick the 4 GB evidence volume, NOT the system disk.
+  # what is attached and pick the 2 GB evidence volume, NOT the system disk.
   #
   # The harness resolves this to the live head of the snapshot chain at
   # extraction time. Do not point it at a .vmdk path directly: once a
@@ -98,7 +103,7 @@ paths:
   qemu_img: null
   vdiskmanager: "C:/Program Files/VMware/VMware Workstation/vmware-vdiskmanager.exe"
 
-  # The Sleuth Kit: directory containing mmls, fls, istat, icat.
+  # The Sleuth Kit: directory containing mmls, fsstat, fls, istat, icat.
   tsk_bin: "C:/tools/sleuthkit/bin"
 
   # Eric Zimmerman tools, used by parse/parse_runs.py. Optional for capture.
@@ -143,11 +148,9 @@ matrix:
 # Commands beginning with a PowerShell cmdlet are executed by PowerShell;
 # everything else is handed to cmd.exe. See Invoke-Step in run_wipe.ps1.
 #
-# WARNING: the Eraser, CCleaner and BCWipe invocations below are unverified
-# starting points. Their CLIs are version-sensitive and in CCleaner's case
-# barely documented. Validate each by hand (README step 4) before committing
-# to the full matrix — a tool that silently wipes nothing still produces a
-# complete-looking run folder.
+# Every command below was verified by hand in the guest (PART4-MANUAL-TESTS.md).
+# If you add a tool or change a version, verify it the same way first - a tool
+# that silently wipes nothing still produces a complete-looking run folder.
 # ---------------------------------------------------------------------------
 
 tools:
@@ -223,8 +226,7 @@ tools:
         per_file: '"C:\Program Files (x86)\BleachBit\bleachbit_console.exe" --shred "{target}"'
 
   # VERIFIED: BleachBit 4.x needs the Visual C++ 2010 runtime (msvcr100.dll,
-  # both x86 and x64 copies were required in testing). Without it the
-  # installer raises a modal fc-cache.exe error. prepare_baseline.ps1 step 8
+  # x86). Without it the installer raises a modal msvcr100.dll error. prepare_baseline.ps1 step 8
   # installs it into the BASELINE so every run carries it uniformly.
   bleachbit4:
     display: "BleachBit 4.6.0"

@@ -627,7 +627,7 @@ This does in one pass what would otherwise be ten error-prone manual steps:
 | 2 | `fsutil usn createjournal m=16MB a=1MB D:` | pins `$UsnJrnl` independently of volume size |
 | 3 | `chkdsk D: /L:16384` | pins `$LogFile` at 16 MB so it cannot wrap mid-run |
 | 4 | `powercfg /h off`, pagefile off, VSS capped at 2 GB | reclaims ~5.5 GB on a 4 GB-RAM guest |
-| 5 | Disables Update, Search, SysMain, DiagTrack, Defender RTP | removes background churn; Defender quarantines several wiping tools |
+| 5 | Disables Update, Search, DiagTrack, Defender RTP; **keeps Prefetch on** (SysMain) | removes background churn; Defender quarantines several wiping tools; Prefetch is evidence |
 | 6 | `EnableLUA = 0` | `runProgramInGuest` uses a filtered token; silent installers cannot elevate under UAC |
 | 7 | `ErrorMode=2`, WER `DontShowUI=1` | a modal dialog blocks an unattended run until the step times out; this turns hard errors into ordinary failures |
 | 8 | Checks `msvcr100.dll`; installs VC++ 2010 x86 if absent | BleachBit 4.x needs it |
@@ -1035,10 +1035,10 @@ started, so Windows has not finished booting or is stuck before reaching the
 desktop. Find out which with:
 
 ```bat
-py runner.py --tool sdelete --mode p3 --limit 1 -v --gui
+py runner.py --tool sdelete --mode p3 --limit 1 -v
 ```
 
-`--gui` opens the VM's window so you can see its screen. Typical causes:
+Runs open the VM's window by default, so you can see its screen. Typical causes:
 
 | What you see | Fix |
 |---|---|
@@ -1060,6 +1060,28 @@ Set-ItemProperty $k DefaultPassword '<vm.guest_pass>'
 This stores the password in the registry in plain text - acceptable for an
 isolated lab VM, and worth one line in the limitations.
 
+**VM only progresses while its window is open.** Symptom: in a headless
+run Tools stays `installed` for minutes, but the moment you open the VM in
+Workstation it reports `running` and the run continues. Windows 11 throttles
+processes it considers background work ("power throttling" / efficiency
+mode), and a VM with no window is exactly that. On hybrid CPUs (performance
+and efficiency cores) it can also be moved to the slow cores. Exempt the VM
+process once, in an **elevated** PowerShell on the host:
+
+```powershell
+powercfg /powerthrottling disable /path "C:\Program Files\VMware\VMware Workstation\x64\vmware-vmx.exe"
+powercfg /powerthrottling list
+```
+
+and set the host power mode to **Best performance** (Settings > System >
+Power & battery) and keep it plugged in for the overnight run.
+
+This is why runs show the VM's window **by default** (`vm.gui: true`).
+Leave the Workstation window open and **not minimised** during the matrix -
+a minimised window can be throttled the same way. Once the exemption above
+is in place you can try `--headless` (or `vm.gui: false`); the evidence is
+identical either way.
+
 If you stop a run with Ctrl+C, the harness now powers the VM off. Older
 versions left it running headless; if that happened, stop it in Workstation
 before the next run.
@@ -1077,7 +1099,8 @@ waits for Workstation to release its `*.lck` lock directories.
 
 ### Stage 2 — BOOT  (`_stage_boot` → `vmware.wait_for_guest`)
 
-Powers on headless, then polls until guest operations actually work.
+Powers on (with its window by default; `--headless` for none), then polls
+until guest operations actually work.
 `checkToolsState` returning `running` is necessary but **not sufficient** —
 Tools answers before the interactive logon session that guest ops bind to is
 ready. The authoritative test is executing a trivial program, so that is what
@@ -1170,7 +1193,7 @@ With the VM **off**:
    > not a filename.
 
 2. **Flatten the chain.** TSK cannot traverse sparse or delta-linked VMDKs,
-   so `vmware-vdiskmanager -r -t 0` (or `qemu-img convert -f vmdk -O raw`)
+   so `vmware-vdiskmanager -r -t 2` (or `qemu-img convert -f vmdk -O raw`)
    collapses it. Both follow the `parentFileNameHint` automatically. With a
    2 GB evidence disk this takes well under a minute and needs 2 GB of
    scratch.
@@ -1277,7 +1300,7 @@ The gzipped evidence is already in a convenient form for this.
 
 - Synthetic VM images, not seized media; no organic wear or background usage.
 - UAC disabled, Defender real-time protection off, Windows Update / Search /
-  SysMain / DiagTrack disabled — all deviate from a realistic endpoint and
+  DiagTrack disabled (SysMain kept, so Prefetch is recorded) — all deviate from a realistic endpoint and
   remove update and indexing churn from the journals.
 - Pagefile and hibernation disabled to reduce the virtual disk footprint.
 - The VM's network adapter is disconnected for the matrix, so no tool can

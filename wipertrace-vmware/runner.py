@@ -178,9 +178,12 @@ class Harness:
                                        cfg["paths"].get("vdiskmanager"))
         self.tsk_bin = cfg["paths"].get("tsk_bin")
         self.compress = bool(cfg.get("extract", {}).get("compress", True))
-        # --gui: show the VM window during runs, for watching the first run.
-        # Has no effect on the evidence; guest ops behave identically.
-        self.gui = False
+        # Show the VM window during runs (default). Windows 11 hosts throttle
+        # a VM with no window - it can sit at "Tools installed" for minutes
+        # until the window is opened - so a visible window is the reliable
+        # default. Has no effect on the evidence; guest ops are identical.
+        # config vm.gui sets the default; --gui / --headless override it.
+        self.gui = bool(cfg["vm"].get("gui", True))
 
     # -- run plan ----------------------------------------------------------
 
@@ -276,6 +279,16 @@ class Harness:
         """STAGE 2. Power on and wait for the guest-ops channel."""
         self.vm.start(headless=not self.gui)
         self.vm.wait_for_guest(int(self.cfg["vm"].get("boot_timeout", 420)))
+        # The guest answers the instant the desktop session exists, while
+        # Explorer, startup apps and logon scheduled tasks are still running.
+        # Starting the agent then puts that burst of activity alongside the
+        # ground-truth capture and the install, and makes runs less alike.
+        # A fixed quiet period lets every run start from a settled desktop.
+        settle = int(self.cfg["vm"].get("post_logon_settle", 45))
+        if settle > 0:
+            log.info("[%s] desktop up; letting logon activity settle for %ds",
+                     run.run_id, settle)
+            time.sleep(settle)
         status["stages"]["boot"] = "ok"
 
     def _stage_guest(self, run: Run, out: Path, status: dict):
@@ -438,7 +451,7 @@ def preflight(cfg: dict, cfg_path: Path) -> list[str]:
                             "paths.vdiskmanager or paths.qemu_img")
 
     tsk_bin = cfg["paths"].get("tsk_bin")
-    for name in ("mmls", "fls", "istat", "icat"):
+    for name in ("mmls", "fsstat", "fls", "istat", "icat"):
         found = shutil.which(name)
         if not found and tsk_bin:
             found = ((Path(tsk_bin) / f"{name}.exe").exists()
@@ -577,9 +590,17 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="skip runs whose status.json reports ok")
     ap.add_argument("--limit", type=int, help="stop after N runs")
-    ap.add_argument("--gui", action="store_true",
-                    help="show the VM window during runs (to watch a first "
-                         "run or see why the guest is not becoming ready)")
+    ap.add_argument("--boot-test", action="store_true",
+                    help="revert to the baseline, boot WITH a window, wait for "
+                         "guest operations, and LEAVE THE VM RUNNING so you "
+                         "can see why it is not becoming ready")
+    view = ap.add_mutually_exclusive_group()
+    view.add_argument("--gui", dest="gui", action="store_true", default=None,
+                      help="show the VM window during runs (the default; "
+                           "overrides vm.gui: false)")
+    view.add_argument("--headless", dest="gui", action="store_false",
+                      help="run the VM with no window (needs the power-"
+                           "throttling exemption in README Part 5)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -699,6 +720,33 @@ def main():
               "deliberately, since the base is frozen.")
         return
 
+    if args.boot_test:
+        vm = VMware(cfg["paths"]["vmrun"], cfg["vm"]["vmx"],
+                    cfg["vm"]["guest_user"], cfg["vm"]["guest_pass"],
+                    cfg["vm"].get("host_type", "ws"),
+                    cfg["vm"].get("encryption_password"))
+        print("BOOT TEST - the VM window will open. Watch it while this runs.\n")
+        vm.revert(cfg["vm"]["snapshot"])
+        vm.start(headless=False)
+        timeout = int(cfg["vm"].get("boot_timeout", 420))
+        try:
+            vm.wait_for_guest(timeout)
+            print("\nPASS: guest operations work. The boot stage is fine; "
+                  "run the single test run again.")
+        except Exception as exc:
+            print(f"\nFAIL: {exc}")
+            print("\nThe VM has been LEFT RUNNING. Look at its window:")
+            print("  - boot logo / spinning dots  -> Windows is still starting; "
+                  "raise vm.boot_timeout")
+            print("  - blue recovery or BitLocker screen -> the baseline does "
+                  "not boot cleanly; fix it and re-take the snapshot")
+            print("  - login screen -> auto-logon missing (README Part 5)")
+            print("  - desktop -> in the guest run:  Get-Service VMTools")
+            print("    and from the host:  vmrun -T ws -vp <pw> "
+                  "checkToolsState \"<vmx>\"")
+        print("\nPower the VM off in Workstation when you are done.")
+        return
+
     if args.snapshots:
         vm = VMware(cfg["paths"]["vmrun"], cfg["vm"]["vmx"],
                     cfg["vm"]["guest_user"], cfg["vm"]["guest_pass"],
@@ -774,7 +822,8 @@ def main():
         sys.exit(1)
 
     harness = Harness(cfg, cfg_path)
-    harness.gui = args.gui
+    if args.gui is not None:
+        harness.gui = args.gui
 
     if args.resume:
         before = len(runs)

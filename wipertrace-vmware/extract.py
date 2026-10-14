@@ -4,7 +4,7 @@ This is the part that has to be done from outside the VM. Copying $MFT or the
 USN journal from inside a running Windows writes to those very structures, so
 anything collected that way is contaminated by the act of collecting it.
 
-Requires The Sleuth Kit on PATH or at paths.tsk_bin: mmls, fls, istat, icat.
+Requires The Sleuth Kit on PATH or at paths.tsk_bin: mmls, fsstat, fls, istat, icat.
 """
 
 from __future__ import annotations
@@ -26,6 +26,28 @@ INODE_EXTEND = 11
 
 class ExtractError(RuntimeError):
     pass
+
+
+_MMLS_ROW = re.compile(
+    r"^\s*\d+:\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*?)\s*$")
+
+
+def parse_mmls(text: str) -> list[tuple[int, int, str]]:
+    """Return (start_sector, length_sectors, description) for real partitions.
+
+    mmls also lists table metadata ("Meta" slot) and gaps ("-------" slot);
+    neither can hold a file system, so both are dropped.
+    """
+    rows = []
+    for line in text.splitlines():
+        m = _MMLS_ROW.match(line)
+        if not m:
+            continue
+        slot, start, _end, length, desc = m.groups()
+        if slot == "Meta" or slot.startswith("-"):
+            continue
+        rows.append((int(start), int(length), desc))
+    return rows
 
 
 class Tsk:
@@ -51,18 +73,50 @@ class Tsk:
     # -- discovery ---------------------------------------------------------
 
     def ntfs_offset(self, image: Path) -> int:
-        """Find the start sector of the first NTFS partition."""
-        out = self._run("mmls", ["-t", "dos", str(image)])
-        for line in out.splitlines():
-            if "NTFS" in line.upper() or "0x07" in line:
-                parts = line.split()
-                if len(parts) >= 3 and parts[2].isdigit():
-                    offset = int(parts[2])
-                    log.info("NTFS partition at sector %d", offset)
-                    return offset
-        # A disk formatted with no partition table (rare but possible).
-        log.warning("no partition table found; assuming offset 0")
-        return 0
+        """Find the start sector of the NTFS volume on the image.
+
+        Windows 11 Disk Management initialises new disks as GPT, not MBR, so
+        the evidence disk normally holds a 16 MB "Microsoft reserved"
+        partition followed by the NTFS "Basic data" partition. The previous
+        `mmls -t dos` found no DOS table on a GPT disk, fell back to offset 0
+        and handed icat the protective MBR ("invalid sector size").
+
+        Now: let mmls auto-detect the table type (falling back to gpt, then
+        dos), take every real partition, and confirm which one is NTFS with
+        fsstat rather than trusting a description string - GPT descriptions
+        say "Basic data partition", not "NTFS".
+        """
+        layout = None
+        for args in ([], ["-t", "gpt"], ["-t", "dos"]):
+            try:
+                layout = self._run("mmls", args + [str(image)])
+                break
+            except ExtractError:
+                continue
+
+        candidates = parse_mmls(layout) if layout else []
+        # Largest first: the NTFS data partition dwarfs the reserved one.
+        for start, length, desc in sorted(candidates, key=lambda c: -c[1]):
+            if self._is_ntfs(image, start):
+                log.info("NTFS volume at sector %d (%s, %.0f MB)", start,
+                         desc, length * 512 / 1e6)
+                return start
+
+        # A volume formatted with no partition table at all.
+        if self._is_ntfs(image, 0):
+            log.info("NTFS volume at sector 0 (no partition table)")
+            return 0
+
+        raise ExtractError(
+            "no NTFS volume found on the evidence image. mmls reported:\n"
+            + (layout or "(no partition table recognised)"))
+
+    def _is_ntfs(self, image: Path, offset: int) -> bool:
+        try:
+            self._run("fsstat", ["-o", str(offset), "-f", "ntfs", str(image)])
+            return True
+        except ExtractError:
+            return False
 
     def find_usnjrnl(self, image: Path, offset: int) -> int:
         """Return the MFT record number of $Extend\\$UsnJrnl."""
@@ -113,7 +167,7 @@ def gzip_in_place(path: Path, level: int = 6) -> Path:
     Carved journals compress extremely well: $UsnJrnl:$J is a sparse stream
     whose unallocated extents icat materialises as runs of zeroes, and
     $LogFile/$MFT consist of highly repetitive fixed-layout records. Observed
-    ratios are roughly 5-10x, which takes the 72-run matrix from ~3.4 GB of
+    ratios are roughly 5-10x, which takes the 60-run matrix from ~2.8 GB of
     output to well under 1 GB.
 
     Parsers cannot read gzip directly, so parse_runs.py transparently
