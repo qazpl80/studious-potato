@@ -627,7 +627,7 @@ This does in one pass what would otherwise be ten error-prone manual steps:
 | 2 | `fsutil usn createjournal m=16MB a=1MB D:` | pins `$UsnJrnl` independently of volume size |
 | 3 | `chkdsk D: /L:16384` | pins `$LogFile` at 16 MB so it cannot wrap mid-run |
 | 4 | `powercfg /h off`, pagefile off, VSS capped at 2 GB | reclaims ~5.5 GB on a 4 GB-RAM guest |
-| 5 | Disables Update, Search, SysMain, DiagTrack, Defender RTP | removes background churn; Defender quarantines several wiping tools |
+| 5 | Disables Update, Search, DiagTrack, Defender RTP; **keeps Prefetch on** (SysMain) | removes background churn; Defender quarantines several wiping tools; Prefetch is evidence |
 | 6 | `EnableLUA = 0` | `runProgramInGuest` uses a filtered token; silent installers cannot elevate under UAC |
 | 7 | `ErrorMode=2`, WER `DontShowUI=1` | a modal dialog blocks an unattended run until the step times out; this turns hard errors into ordinary failures |
 | 8 | Checks `msvcr100.dll`; installs VC++ 2010 x86 if absent | BleachBit 4.x needs it |
@@ -1300,7 +1300,7 @@ The gzipped evidence is already in a convenient form for this.
 
 - Synthetic VM images, not seized media; no organic wear or background usage.
 - UAC disabled, Defender real-time protection off, Windows Update / Search /
-  SysMain / DiagTrack disabled — all deviate from a realistic endpoint and
+  DiagTrack disabled (SysMain kept, so Prefetch is recorded) — all deviate from a realistic endpoint and
   remove update and indexing churn from the journals.
 - Pagefile and hibernation disabled to reduce the virtual disk footprint.
 - The VM's network adapter is disconnected for the matrix, so no tool can

@@ -179,10 +179,16 @@ try {
 Step 5 "Suppress background filesystem churn"
 # ---------------------------------------------------------------------------
 
-# Windows Update, Defender scans, Search indexing and SysMain all write to
-# the filesystem continuously. On the evidence volume that churn is
-# indistinguishable, at parse time, from tool activity.
-foreach ($svc in 'wuauserv', 'WSearch', 'SysMain', 'DiagTrack') {
+# Windows Update, Defender scans and Search indexing write to the filesystem
+# continuously. On the evidence volume that churn is indistinguishable, at
+# parse time, from tool activity.
+#
+# SysMain is deliberately NOT disabled. It is the service that writes
+# Prefetch files, and Prefetch execution evidence (SDELETE64.EXE-*.pf etc.)
+# is one of the artefact classes WiperTrace correlates. With SysMain off,
+# no run produces a tool Prefetch file at all. Its writes go to C:, not to
+# the evidence volume D:.
+foreach ($svc in 'wuauserv', 'WSearch', 'DiagTrack') {
     try {
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
         Set-Service -Name $svc -StartupType Disabled -ErrorAction Stop
@@ -191,7 +197,19 @@ foreach ($svc in 'wuauserv', 'WSearch', 'SysMain', 'DiagTrack') {
         Warn "could not disable $svc (may not exist on this edition)"
     }
 }
-Note "Windows Update, Search indexing, SysMain and DiagTrack disabled in the guest."
+Note "Windows Update, Search indexing and DiagTrack disabled in the guest."
+
+# Make sure Prefetch is ON (3 = applications + boot). A previous version of
+# this script disabled SysMain, which silently stopped Prefetch creation.
+try {
+    $pf = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters'
+    Set-ItemProperty -Path $pf -Name EnablePrefetcher -Value 3 -Type DWord -ErrorAction Stop
+    Set-Service -Name SysMain -StartupType Automatic -ErrorAction Stop
+    Start-Service -Name SysMain -ErrorAction SilentlyContinue
+    Ok "Prefetch enabled (SysMain automatic, EnablePrefetcher=3)"
+} catch {
+    Warn "could not enable Prefetch: $_ - tool Prefetch evidence will be missing"
+}
 
 # Exclude the evidence volume from Search indexing even if WSearch returns.
 try {
