@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  autounattend.xml — automates Windows 11 OOBE for the WiperTrace baseline VM.
+
+  PURPOSE
+  Windows 11 Home/Pro setup forces a Microsoft account sign-in during OOBE.
+  The Shift+F10 workarounds (BypassNRO, ms-cxh:localonly) are build-specific
+  and Microsoft keeps closing them. An answer file is the supported mechanism
+  and is therefore build-independent.
+
+  It also solves a second problem. VIX guest operations launched with
+  -interactive bind to the console session, so the guest needs an active
+  interactive logon. The AutoLogon block below provides one, which makes the
+  harness markedly more reliable than a VM sitting at a lock screen.
+
+  SCOPE
+  Only the oobeSystem pass is specified, so Windows Setup still prompts
+  interactively for language, edition and target disk. That is deliberate:
+  you want to choose the disk yourself rather than risk an answer file
+  formatting the wrong one. Everything after the file copy is automated.
+
+  USAGE
+  1. Edit the three marked values below to match config.yaml.
+  2. Put this file, named exactly autounattend.xml, at the ROOT of a small
+     ISO (ImgBurn, or oscdimg from the Windows ADK):
+         oscdimg -n -m C:\unattend C:\unattend.iso
+  3. In VM Settings, add a SECOND CD/DVD drive pointing at that ISO, and
+     leave the Windows installer ISO on the first. Setup searches all
+     attached removable media for autounattend.xml.
+  4. Install as normal. OOBE completes without prompting for an account.
+  5. AFTER the baseline snapshot is taken, detach this second drive so the
+     answer file is not present during the experiment runs.
+
+  SECURITY NOTE
+  The password below is stored in plain text. This is a disposable lab VM on
+  an isolated virtual network, so that is acceptable; do not reuse a password
+  you use elsewhere. The value must match vm.guest_pass in config.yaml, and
+  it must be NON-EMPTY — the VIX API rejects blank-password authentication.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+      <!-- EDIT: must match the Asia/Singapore host, or timestamps in the
+           manifest and the journals will be offset from each other. -->
+      <TimeZone>Singapore Standard Time</TimeZone>
+
+      <OOBE>
+        <!-- HideOnlineAccountScreens is the documented setting that
+             suppresses the Microsoft-account requirement. -->
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <HideLocalAccountScreen>false</HideLocalAccountScreen>
+        <!-- 3 = do not enable the express/recommended settings. Keeps
+             telemetry and diagnostics minimal, which also reduces the
+             background filesystem churn the journals would otherwise see. -->
+        <ProtectYourPC>3</ProtectYourPC>
+        <NetworkLocation>Work</NetworkLocation>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <!-- EDIT: must match vm.guest_user in config.yaml -->
+            <Name>analyst</Name>
+            <DisplayName>analyst</DisplayName>
+            <Description>WiperTrace harness account</Description>
+            <!-- Local administrator: required for the harness's silent
+                 installers and for VSS shadow-copy creation. -->
+            <Group>Administrators</Group>
+            <Password>
+              <!-- EDIT: must match vm.guest_pass in config.yaml -->
+              <Value>Analyst!2026</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!-- Provides the interactive console session that VIX
+           runProgramInGuest -interactive requires. -->
+      <AutoLogon>
+        <Username>analyst</Username>
+        <Password>
+          <Value>Analyst!2026</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>999</LogonCount>
+      </AutoLogon>
+
+      <!-- Suppress the first-logon "let's finish setting up" interruptions,
+           which can otherwise steal focus from an installer mid-run. -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Disable consumer features and OOBE nags</Description>
+          <CommandLine>reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Suppress post-OOBE setup prompts</Description>
+          <CommandLine>reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" /v ScoobeSystemSettingEnabled /t REG_DWORD /d 0 /f</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+    </component>
+  </settings>
+</unattend>

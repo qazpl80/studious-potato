@@ -1,0 +1,341 @@
+# WiperTrace data-generation harness — VMware Workstation configuration
+#
+# All paths are HOST paths unless the key name says "guest".
+# Validate with:  python runner.py --check
+# ---------------------------------------------------------------------------
+
+vm:
+  # Absolute path to the .vmx. This is VMware's VM identifier — there is no
+  # registered-name namespace as in VirtualBox, so every vmrun call takes
+  # this path.
+  vmx: "C:/VMs/WiperVM/WiperVM.vmx"
+
+  # Baseline snapshot restored before every run. Must exist (see --snapshots).
+  snapshot: "clean"
+
+  # VIX provider: "ws" for Workstation Pro, "player" for Workstation Player
+  # (reduced command set; snapshot operations are unavailable on Player, so
+  # Pro is effectively required for this harness).
+  host_type: "ws"
+
+  # Guest credentials for VIX guest operations. The account MUST have a
+  # non-empty password or the API rejects authentication, and it must be a
+  # local administrator for installers to succeed. See README step 2.7 on
+  # disabling UAC in the baseline.
+  guest_user: "analyst"
+  guest_pass: "Analyst!2026"
+
+  # VM-ENCRYPTION password, distinct from the guest account above.
+  #
+  # Workstation requires a virtual machine to be encrypted before it will
+  # attach a virtual TPM, and Windows 11 requires a TPM - so a
+  # Workstation-created Windows 11 guest is normally encrypted, even if you
+  # never chose encryption yourself. Workstation may have prompted for this
+  # password at VM creation and stored it in Windows Credential Manager, so
+  # the GUI opens the VM without asking while vmrun still needs it.
+  #
+  # Symptom when unset: every vmrun call fails with
+  #   Error: Cannot open VM: ...vmx, Incorrect password
+  #
+  # Leave null if the VM is not encrypted. The harness passes it to vmrun
+  # as -vp when set.
+  encryption_password: null
+
+  # Show the VM's window during runs. true is the reliable choice on a
+  # Windows 11 host, which throttles a window-less VM until it is opened.
+  # Override per invocation with --gui / --headless.
+  gui: true
+  boot_timeout: 420          # seconds to wait for guest ops to come up
+  post_logon_settle: 45      # quiet period after the desktop appears, before the agent starts
+  settle_seconds: 15         # in-guest quiesce before the host cuts power
+
+# ---------------------------------------------------------------------------
+# BASELINE VM GEOMETRY (for reference; set when you create the VM)
+#
+#   Disk 1 (C:)  32 GB declared, thin-provisioned  -> ~14-16 GB consumed
+#   Disk 2 (D:)   2 GB declared, thin-provisioned  -> ~0.3 GB consumed
+#
+# Do NOT tick "Allocate all disk space now": thin provisioning means the
+# declared size is a ceiling, not a reservation.
+#
+# The evidence volume can be this small because trace capacity is pinned
+# independently of volume size by guest/prepare_baseline.ps1:
+#   $UsnJrnl -> 16 MB via `fsutil usn createjournal`
+#   $LogFile -> 16 MB via `chkdsk D: /L:16384`
+# NTFS would otherwise scale $LogFile with volume size, giving a 2 GB volume
+# a log of only a few MB that wraps mid-experiment. A 40-file wipe generates
+# roughly 0.8 MB of $LogFile records and 0.26 MB of USN records, so 16 MB is
+# ~20x and ~60x headroom respectively. Raise both if you increase
+# corpus.wipe_count substantially.
+# ---------------------------------------------------------------------------
+
+disks:
+  # Controller address of the EVIDENCE disk as written in the .vmx, e.g.
+  # nvme0:1, scsi0:1, sata0:1. Run `python runner.py --show-disks` to list
+  # what is attached and pick the 2 GB evidence volume, NOT the system disk.
+  #
+  # The harness resolves this to the live head of the snapshot chain at
+  # extraction time. Do not point it at a .vmdk path directly: once a
+  # snapshot exists, the base VMDK is frozen and holds the pristine
+  # baseline, so imaging it would discard every wipe.
+  data_device: "nvme0:1"
+
+  # Optionally also image the system disk offline each run, to obtain
+  # Prefetch/Amcache from a cold image rather than via in-guest VSS.
+  # Forensically cleaner, but adds several minutes per run for a 40 GB disk.
+  system_offline: false
+  system_device: "nvme0:0"
+
+paths:
+  work: "./runs"
+
+  # NOTE: Workstation 17 and later install the 64-bit binaries under
+  # %ProgramFiles%; older releases used %ProgramFiles(x86)%. If either path
+  # below is wrong for your install, run `python runner.py --find-vmware`,
+  # which locates them via PATH, the registry and both Program Files trees
+  # and prints the exact value to paste here.
+  vmrun: "C:/Program Files/VMware/VMware Workstation/vmrun.exe"
+
+  # Disk flattening backend. vmware-vdiskmanager.exe ships with Workstation,
+  # so if Workstation is installed this dependency is already satisfied and
+  # qemu_img can stay null. Set qemu_img only if you have it: it emits a
+  # single raw file rather than a descriptor plus a -flat.vmdk payload.
+  qemu_img: null
+  vdiskmanager: "C:/Program Files/VMware/VMware Workstation/vmware-vdiskmanager.exe"
+
+  # The Sleuth Kit: directory containing mmls, fsstat, fls, istat, icat.
+  tsk_bin: "C:/tools/sleuthkit/bin"
+
+  # Eric Zimmerman tools, used by parse/parse_runs.py. Optional for capture.
+  mftecmd: "C:/tools/ezt/MFTECmd.exe"
+  pecmd: "C:/tools/ezt/PECmd.exe"
+
+extract:
+  # gzip each carved journal immediately after extraction. Carved artefacts
+  # are highly compressible: $J is a sparse stream whose unallocated extents
+  # icat materialises as zero runs, and $MFT/$LogFile are repetitive
+  # fixed-layout records. This takes the 60-run matrix from ~2.8 GB of output
+  # to a few hundred MB. parse_runs.py decompresses transparently, so the
+  # parsing stage is unaffected. Set false only if you need to point external
+  # tools straight at runs/<id>/evidence/.
+  compress: true
+
+corpus:
+  guest_dir: "D:\\corpus"    # govdocs1 sample files inside the guest
+
+  # Targets per run. The agent takes the first N files sorted by name, so the
+  # corpus needs only a little more than this; the remainder supplies
+  # background MFT records for realism. ~150 files (~100 MB) is ample on a
+  # 2 GB evidence volume.
+  wipe_count: 40
+
+matrix:
+  repeats: 3                 # runs per tool/mode/shutdown combination
+  # Shutdown mode is an experimental variable, not a convenience:
+  #   clean = ACPI shutdown; NTFS flushes and checkpoints $LogFile
+  #   hard  = power cut; in-flight transaction records survive, as on a
+  #           machine seized without a graceful shutdown
+  shutdown_modes: ["clean", "hard"]
+
+# ---------------------------------------------------------------------------
+# Tool matrix
+#
+# install   : runs once per run before the wipe. Omit for portable tools.
+# pre       : optional state-setup command.
+# per_file  : invoked once per target. {target} = absolute file path.
+# once      : invoked once for the volume. {dir} = corpus directory.
+#
+# Commands beginning with a PowerShell cmdlet are executed by PowerShell;
+# everything else is handed to cmd.exe. See Invoke-Step in run_wipe.ps1.
+#
+# Every command below was verified by hand in the guest (PART4-MANUAL-TESTS.md).
+# If you add a tool or change a version, verify it the same way first - a tool
+# that silently wipes nothing still produces a complete-looking run folder.
+# ---------------------------------------------------------------------------
+
+tools:
+
+  # ===========================================================================
+  # TOOL STATUS - finalised from manual verification in the guest
+  # (PART4-MANUAL-TESTS.md). Every install switch and binary path below was
+  # observed working, not assumed.
+  #
+  #   tool         status    install                        verified binary
+  #   ----------   -------   ----------------------------   ----------------------------------------------
+  #   sdelete      ENABLED   portable (ISO)                 E:\sdelete\sdelete64.exe
+  #   cipher       ENABLED   built in                       cipher.exe
+  #   bleachbit6   ENABLED   /allusers /S                   C:\Program Files (x86)\BleachBit\bleachbit_console.exe
+  #   bleachbit4   ENABLED   /allusers /S  (+VC++ 2010)     C:\Program Files (x86)\BleachBit\bleachbit_console.exe
+  #   eraser       ENABLED   msiexec on extracted MSI       C:\Program Files\Eraser\Eraser.exe
+  #   ccleaner     DISABLED  /S works; no wipe CLI          C:\Program Files\Piriform\CCleaner 7\CCleaner.exe
+  #   bcwipe       DISABLED  -S -Z -T works; errors = GUI   C:\Program Files (x86)\Jetico\BCWipe\BCWipe.exe
+  #
+  # Per-tool fields beyond the command strings:
+  #   binary            path that must exist before the wipe runs. The agent
+  #                     polls for it after installing and FAILS THE RUN if it
+  #                     never appears, so a silent install failure cannot
+  #                     produce a run that wipes nothing yet looks valid.
+  #   await_targets_sec for asynchronous wipers: after the wipe commands
+  #                     return, poll until every target path is gone (or this
+  #                     many seconds pass) before settling. Exit codes from
+  #                     such tools are meaningless - Eraser returns 0 while
+  #                     still queued.
+  #   settle_seconds    per-tool override of vm.settle_seconds.
+  #
+  # Installer filenames on the ISO are canonical (lowercase, no spaces) - see
+  # README section 1.5 and validate with tools\check_installers.py.
+  # ===========================================================================
+
+  sdelete:
+    display: "SDelete 2.05 (Sysinternals)"
+    portable: true
+    binary: 'E:\sdelete\sdelete64.exe'
+    modes:
+      # -accepteula is mandatory: without it the first run shows a licence
+      # dialog that blocks forever.
+      p1:
+        per_file: 'E:\sdelete\sdelete64.exe -accepteula -nobanner -p 1 "{target}"'
+      p3:
+        per_file: 'E:\sdelete\sdelete64.exe -accepteula -nobanner -p 3 "{target}"'
+
+  cipher:
+    display: "cipher.exe (Windows built-in)"
+    portable: true
+    modes:
+      # cipher /w scrubs unallocated clusters only and never renames a named
+      # file, so the corpus is deleted first to create free space to scrub.
+      # Ground truth for this mode is the pre-deletion record set.
+      freespace:
+        pre: 'Remove-Item -Path "{dir}\*" -Force -Recurse'
+        once: 'cipher.exe /w:D:\'
+
+  # The two BleachBit entries are a deliberate version pair: the same tool at
+  # two releases shows whether a signature survives a version bump.
+  #   current: https://www.bleachbit.org/download/windows
+  #   older  : https://sourceforge.net/projects/bleachbit/files/bleachbit/
+  #
+  # VERIFIED: /S alone still shows the wizard - the installer also needs the
+  # install scope, and /allusers must precede /S. /allusers installs to
+  # %ProgramFiles(x86)%\BleachBit, which the binary path below assumes.
+  bleachbit6:
+    display: "BleachBit 6.0.4"
+    install: 'E:\bleachbit\bleachbit-6.0.4-setup.exe /allusers /S'
+    binary: 'C:\Program Files (x86)\BleachBit\bleachbit_console.exe'
+    modes:
+      shred:
+        per_file: '"C:\Program Files (x86)\BleachBit\bleachbit_console.exe" --shred "{target}"'
+
+  # VERIFIED: BleachBit 4.x needs the Visual C++ 2010 runtime (msvcr100.dll,
+  # x86). Without it the installer raises a modal msvcr100.dll error. prepare_baseline.ps1 step 8
+  # installs it into the BASELINE so every run carries it uniformly.
+  bleachbit4:
+    display: "BleachBit 4.6.0"
+    install: 'E:\bleachbit\bleachbit-4.6.0-setup.exe /allusers /S'
+    binary: 'C:\Program Files (x86)\BleachBit\bleachbit_console.exe'
+    modes:
+      shred:
+        per_file: '"C:\Program Files (x86)\BleachBit\bleachbit_console.exe" --shred "{target}"'
+
+  # VERIFIED: the distributed "Eraser 6.2.0.2996.exe" is a bootstrapper that
+  # ignores every silent switch. The MSI is extracted on the host with 7-Zip
+  # (PART4 section 5a) and staged as eraser-x64.msi.
+  #
+  # `start "" /wait` makes cmd.exe block until msiexec finishes, so the
+  # binary check that follows does not race the installer.
+  #
+  # Wipe syntax VERIFIED against `Eraser.exe help` (6.2.0.2996):
+  #   - switches use a single forward slash: /quiet, /method=
+  #   - a file target is the single token "file=<path>"
+  #   - /quiet suppresses the "Press any key to continue" console pause
+  #   - methods by GUID, since names contain spaces and parentheses
+  #       Gutmann            1407fc4e-feff-4375-b4fb-d7efbb7e9922
+  #       Pseudorandom Data  bf8ba267-231a-4085-9bf9-204de65a6641
+  #
+  # Eraser queues work through its background service and returns exit code
+  # 0 immediately, so the agent waits for the targets to disappear
+  # (await_targets_sec) rather than trusting the exit code. Gutmann is 35
+  # passes per file, hence the generous ceiling.
+  eraser:
+    display: "Eraser 6.2.0.2996"
+    install: 'start "" /wait msiexec /i "E:\eraser\eraser-x64.msi" /qn /norestart'
+    binary: 'C:\Program Files\Eraser\Eraser.exe'
+    await_targets_sec: 900
+    settle_seconds: 30
+    modes:
+      gutmann:
+        per_file: '"C:\Program Files\Eraser\Eraser.exe" erase /quiet /method=1407fc4e-feff-4375-b4fb-d7efbb7e9922 "file={target}"'
+      pseudorandom:
+        per_file: '"C:\Program Files\Eraser\Eraser.exe" erase /quiet /method=bf8ba267-231a-4085-9bf9-204de65a6641 "file={target}"'
+
+  # TESTED AND EXCLUDED. Kept so the finding stays on record; `py runner.py
+  # --list` prints the reason, and `--tool ccleaner` re-tests it.
+  ccleaner:
+    display: "CCleaner 7.12.1526 (offline installer)"
+    enabled: false
+    disabled_reason: |
+      No command-line interface for secure deletion or free-space wiping.
+      /DRIVE D: /WIPEFREESPACE returns in 0.0 s with free space unchanged;
+      the Drive Wiper is GUI-only. /AUTO cleans CCleaner's own locations on
+      the system volume, never the evidence volume. Verified on 7.12.1526.
+    install: 'E:\ccleaner\ccleaner-offline-setup.exe /S'
+    binary: 'C:\Program Files\Piriform\CCleaner 7\CCleaner.exe'
+    modes:
+      wipefree:
+        once: '"C:\Program Files\Piriform\CCleaner 7\CCleaner.exe" /DRIVE D: /WIPEFREESPACE'
+
+  # TESTED AND EXCLUDED. Install works with -S -Z -T (note -Z: without it the
+  # installer INVERTS its exit code, 0 = error). But BCWipe.exe reports
+  # command-line errors as modal MessageBox dialogs, which ErrorMode=2 does
+  # not suppress, and its CLI syntax is undocumented in the shipped files.
+  bcwipe:
+    display: "BCWipe 7.60 (Jetico, trial)"
+    enabled: false
+    disabled_reason: |
+      Command-line errors are reported through modal GUI dialogs rather than
+      console output or exit codes ("Invalid wiping type 'help'"), and the
+      CLI syntax is undocumented in the shipped files. Any malformed
+      argument, expired trial or unreadable target would block an
+      unattended run. Excluded as unsafe to automate. Verified on 7.60.
+    install: 'E:\bcwipe\bcwipe-setup.exe -S -Z -T -NoPrivacyGuard -NoSwapFile'
+    binary: 'C:\Program Files (x86)\Jetico\BCWipe\BCWipe.exe'
+    modes:
+      dod:
+        per_file: '"C:\Program Files (x86)\Jetico\BCWipe\BCWipe.exe" -md DOD -f "{target}"'
+
+  # ---------------------------------------------------------------------------
+  # Negative controls. Without runs in which nothing was wiped, the
+  # false-positive rate of any detection rule is unmeasurable.
+  # ---------------------------------------------------------------------------
+
+  control_delete:
+    display: "Control: ordinary deletion"
+    portable: true
+    modes:
+      explorer:
+        per_file: 'Remove-Item -LiteralPath "{target}" -Force'
+      # On a data volume the recycle bin may be bypassed; if so this mode is
+      # a second ordinary-delete control. Check D:\$Recycle.Bin in testing.
+      recycle:
+        once: |
+          Add-Type -AssemblyName Microsoft.VisualBasic
+          Get-ChildItem -Path "{dir}" -File | Select-Object -First 40 | ForEach-Object {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+              $_.FullName, 'OnlyErrorDialogs', 'SendToRecycleBin')
+          }
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+
+  control_churn:
+    display: "Control: benign rename-heavy activity"
+    portable: true
+    modes:
+      churn:
+        once: |
+          # Rename bursts like Office autosave or Git checkouts - the main
+          # confounder for rename-chain signatures. Must NOT delete anything.
+          $files = Get-ChildItem -Path "{dir}" -File | Select-Object -First 40
+          foreach ($f in $files) {
+            $tmp = Join-Path $f.DirectoryName ("~$" + [guid]::NewGuid().ToString("N").Substring(0,8) + ".tmp")
+            Rename-Item -LiteralPath $f.FullName -NewName (Split-Path $tmp -Leaf)
+            Start-Sleep -Milliseconds 20
+            Rename-Item -LiteralPath $tmp -NewName $f.Name
+          }
